@@ -1,16 +1,30 @@
 #include <SPI.h>
 #include <Ethernet.h>
 #include <PubSubClient.h>
+#include <DHT.h>
+
+#define DHTPIN 2 
+#define DHTTYPE DHT11 
+DHT dht(DHTPIN, DHTTYPE);
 
 const int SOIL_SENSOR_DRYCEILING = 645;
 const int SOIL_SENSOR_WETCEILING = 289;
 const int WATERING_COOLDOWN = 5000;
 const int IP = 1883;
 
+const char* WATERING_SYSTEM = "WateringSystem";
+const char* WATERING_SYSTEM_STATUS = "WateringSystem/Status";
+const char* WATERING_SYSTEM_FEEDBACK = "WateringSystem/Feedback";
+
+const char* PLANT_TEMPERATURE = "Plant/Temperature";
+const char* PLANT_MOISTURE = "Plant/Moisture";
+const char* PLANT_HUMIDITY = "Plant/Humidity";
+
 int RELAY = 8;
 byte mac[] = {  0xDE, 0xED, 0xBA, 0xFE, 0xFE, 0xED };  
 
 unsigned long lastWatered = 0;
+unsigned long lastMeasurementPublished = 0;
 
 IPAddress ip(192, 168, 1, 102);
 IPAddress server(192, 168, 1, 71); //Home IP address
@@ -18,6 +32,7 @@ IPAddress server(192, 168, 1, 71); //Home IP address
 
 EthernetClient ethClient;
 PubSubClient client(ethClient);
+
 
 void messageReceivedCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print("Message arrived [");
@@ -29,15 +44,63 @@ void messageReceivedCallback(char* topic, byte* payload, unsigned int length) {
   }
   Serial.println();
   //Check if the message was published on the topic wateringSystem
-  if(strcmp(topic, "wateringSystem") == 0 && millis() - lastWatered >= WATERING_COOLDOWN){
-    WaterPlant();
+  if(isSameTopic(topic, WATERING_SYSTEM) && isEligibleForWatering()){
+    waterPlant();
   }else{
-    client.publish("wateringSystemFeedback", "[ {\"error\": { \"message\": \"Watering system is on cooldown!\" } } ]");
+    client.publish(WATERING_SYSTEM_FEEDBACK, "Watering system is on cooldown");
   }
 }
 
+bool isSameTopic(char* firstValue, char* secondValue){
+  return strcmp(firstValue, secondValue) == 0;
+}
+
+bool isEligibleForWatering(){
+  return millis() - lastWatered >= WATERING_COOLDOWN;
+}
+
 void SubToChannels() {
-  client.subscribe("wateringSystem");
+  client.subscribe(WATERING_SYSTEM);
+}
+
+int readMoisture(){
+    int sensorMeasurements = analogRead(A0);
+    int percentageHumidity = map(sensorMeasurements, SOIL_SENSOR_WETCEILING, SOIL_SENSOR_DRYCEILING, 100, 0);
+    // Serial.println((String)percentageHumidity + "% wet");
+    return percentageHumidity;
+}
+
+void waterPlant(){
+    //Assign this value to the current time in ms
+    lastWatered = millis();
+    digitalWrite(RELAY, HIGH);
+    client.publish(WATERING_SYSTEM_STATUS, "ON");
+    delay(750);
+    digitalWrite(RELAY, LOW);
+    client.publish(WATERING_SYSTEM_STATUS, "OFF");
+}
+
+void publishSensorData(){
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+  if(!isnan(humidity) && !isnan(temperature)){
+    
+    client.publish(PLANT_TEMPERATURE, String(temperature).c_str());
+    client.publish(PLANT_HUMIDITY, String(humidity).c_str());
+    client.publish(PLANT_MOISTURE, String(readMoisture()).c_str());
+  }
+  lastMeasurementPublished = millis();
+}
+
+void handlePlantCare(){
+    int groundMoisture = readMoisture();
+    if((millis() - lastMeasurementPublished) >= 5000){
+      publishSensorData();
+    }
+    //Check every x minutes
+    if((millis() - lastWatered) >= 300000 && groundMoisture <= 40){
+        waterPlant();
+    }
 }
 
 void reconnect() {
@@ -64,14 +127,15 @@ void setup()
   client.setCallback(messageReceivedCallback);
   Ethernet.begin(mac, ip);
   pinMode(RELAY, OUTPUT);
-
+  dht.begin();
   // Allow the hardware to sort itself out
   delay(2000);
 }
 
+
 void loop()
 {
-  HandlePlantCare();
+  handlePlantCare();
   if (!client.connected()) {
     reconnect();
   }
